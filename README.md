@@ -335,4 +335,4 @@ From  browser visit the address of the master node on port 9080. My master node 
 
 http://192.168.0.200:9080/account/login
 
-![img_1.png](img_1.png)
+![login-screen.png](login-screen.png)
