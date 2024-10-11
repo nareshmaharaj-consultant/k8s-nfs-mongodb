@@ -72,8 +72,8 @@ Vagrant.configure("2") do |config|
     node.vm.network "private_network", ip: IP_NW + "#{IP_START + i}"
     node.vm.network "public_network", ip: IP_NW_PUBLIC + "#{IP_START_PUBLIC + i}", bridge: "en0: Wi-Fi"
     node.vm.provider "virtualbox" do |vb|
-        vb.memory = 2048
-        vb.cpus = 1
+        vb.memory = 7168
+        vb.cpus = 2
     end
     #node.vm.provision "shell", path: "scripts/common.sh"
     #node.vm.provision "shell", path: "scripts/node.sh"
@@ -196,7 +196,7 @@ EOF
 ```
 
 On the master node look out for the kubeadm join command as this will need to 
-run on each worked node.
+run on each worked node. It will be different to the one listed below.
 
 ```bash
 sudo kubeadm join 10.0.0.10:6443 --token 0jr71c.ely9zlbz62zt13ev \
@@ -218,156 +218,29 @@ worker-node03   Ready    <none>          62s   v1.27.16   10.0.0.13     <none>  
 ### Storage
 
 Given that we are planning to spin up databases with persistence it makes sense to have a filesystem available.
-Let's go ahead and create a network filesystem that is kubernetes dynamic using a NFS. What I am about to do
-you would not consider this is production verbatim and as we are running this on the laptop it makes 
-perfect sense.
+Let's go ahead and create a locally provisioned storage class that is kubernetes dynamic.  
 
 <B>Rancher Local Provisioner Storage</b><P>
-Alternatively use rancher.io local [provisioner](https://github.com/rancher/local-path-provisioner).
-Then make it the default storage class with
+Use rancher.io local [provisioner](https://github.com/rancher/local-path-provisioner).
+Then make it the default storage class
 ```bash
 kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml
 kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 ```
-
-<B>Network File System</B></P>
-Below are the steps for NFS and will need to do some work on each host so follow the steps below.
-
-#### Master Node
-
-```bash
-sudo mkdir /srv/nfs/kubedata -p
-sudo useradd -M nfsnobody
-sudo chown nfsnobody:nfsnobody /srv/nfs/kubedata/
-sudo apt install nfs-kernel-server -y
-
-sudo tee -a /etc/exports <<EOF
-/srv/nfs/kubedata *(rw,sync,no_subtree_check,no_root_squash,no_all_squash,insecure)
-EOF
-
-sudo exportfs -rav
-sudo systemctl enable nfs-server
-sudo systemctl start nfs-server
-sudo systemctl status nfs-server
-```
-
-#### Each Worker Node
-```bash
-sudo apt install nfs-common -y
-sudo mkdir /kubedata -p
-sudo mount -t nfs 10.0.0.10:/srv/nfs/kubedata /kubedata
-
-# Set dir permissions
-sudo chmod 777 -R /kubedata/
-mount | grep kubedata
-
-# Check you can add files/dir in /kubedata/ and this shows in the master nfs
-cd /kubedata
-touch `hostname`.txt
-
-# Check all the files exist from a single node. Example, 
-# from node01 `ls -l` you should see:
-
-vagrant@worker-node01:/kubedata$ ll
-total 8
-drwxrwxrwx  2    1001    1001 4096 Oct  9 09:07 ./
-drwxr-xr-x 23 root    root    4096 Oct  9 09:06 ../
--rw-rw-r--  1 vagrant vagrant    0 Oct  9 09:07 worker-node01.txt
--rw-rw-r--  1 vagrant vagrant    0 Oct  9 09:07 worker-node02.txt
--rw-rw-r--  1 vagrant vagrant    0 Oct  9 09:07 worker-node03.txt
-
-# For each finally unmount
-sudo umount -l /kubedata
-```
-
-#### Master Node
-```bash
-git clone https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner
-cd nfs-subdir-external-provisioner/
-
-# create a file deployment.yaml ( edit file as below, I added replicas:3 for each worker node. )
-
-cat <<EOF> deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: nfs-client-provisioner
-  labels:
-    app: nfs-client-provisioner
-  # replace with namespace where provisioner is deployed
-  namespace: default
-spec:
-  replicas: 5
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: nfs-client-provisioner
-  template:
-    metadata:
-      labels:
-        app: nfs-client-provisioner
-    spec:
-      serviceAccountName: nfs-client-provisioner
-      containers:
-        - name: nfs-client-provisioner
-          image: k8s.gcr.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
-          volumeMounts:
-            - name: nfs-client-root
-              mountPath: /persistentvolumes
-          env:
-            - name: PROVISIONER_NAME
-              value: k8s-sigs.io/nfs-subdir-external-provisioner
-            - name: NFS_SERVER
-              value: 10.0.0.10
-            - name: NFS_PATH
-              value: /srv/nfs/kubedata
-      volumes:
-        - name: nfs-client-root
-          nfs:
-            server: 10.0.0.10
-            path: /srv/nfs/kubedata
-EOF
-NAME=mongodb
-cp deploy/rbac.yaml rbac-${NAME}.yaml
-cp deploy/class.yaml class.yaml
-cp deployment.yaml deployment-${NAME}.yaml
-NAMESPACE=${NS:-${NAME}}
-sed -i'' "s/namespace:.*/namespace: $NAMESPACE/g" rbac-${NAME}.yaml deployment-${NAME}.yaml
-kubectl create ns ${NAME}
-kubectl create -f rbac-${NAME}.yaml
-kubectl create -f deployment-${NAME}.yaml
-kubectl create -f class.yaml
-```
-
-Check that the Kubernetes Storage Class is available
-```bash
-kubectl get sc
-NAME         PROVISIONER                                   RECLAIMPOLICY   VOLUMEBINDINGMODE   ALLOWVOLUMEEXPANSION   AGE
-nfs-client   k8s-sigs.io/nfs-subdir-external-provisioner   Delete          Immediate           false                  2m26s
-```
-
-#### Each Worker Node
-On each worker node check the mount has occured with `mount | grep kubed`
-```bash
-mount | grep kubed
-10.0.0.10:/srv/nfs/kubedata on /var/lib/kubelet/pods/70b74aeb-8409-422a-a170-752454e38749/volumes/kubernetes.io~nfs/nfs-client-root type nfs4 (rw,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.0.0.11,local_lock=none,addr=10.0.0.10)
-```
-
 
 ### MongoDB
 
 #### Operator
 
 Install the Operator from using git checkout the mongodb repo and then install the operator and the crd's 
-for the specific version. I have chose 1.28.0
+for the specific version. I have chosen 1.26.0 as thats compatability version required for Kubernetes 1.27. 
 ```bash
 cd ~
 git clone https://github.com/mongodb/mongodb-enterprise-kubernetes.git
 cd mongodb-enterprise-kubernetes/
 kubectl create ns mongodb
-kubectl apply -f https://raw.githubusercontent.com/mongodb/mongodb-enterprise-kubernetes/1.28.0/mongodb-enterprise.yaml
-kubectl apply -f https://raw.githubusercontent.com/mongodb/mongodb-enterprise-kubernetes/1.28.0/crds.yaml
+kubectl apply -f https://raw.githubusercontent.com/mongodb/mongodb-enterprise-kubernetes/1.26.0/mongodb-enterprise.yaml
+kubectl apply -f https://raw.githubusercontent.com/mongodb/mongodb-enterprise-kubernetes/1.26.0/crds.yaml
 ```
 
 Check Operator was successfully installed
@@ -375,11 +248,6 @@ Check Operator was successfully installed
 kubectl get pods -n mongodb
 NAME                                           READY   STATUS    RESTARTS   AGE
 mongodb-enterprise-operator-5785dd8cbb-n4685   1/1     Running   0          61s
-nfs-client-provisioner-69854ff78c-4g4sm        1/1     Running   0          46m
-nfs-client-provisioner-69854ff78c-jxgfx        1/1     Running   0          46m
-nfs-client-provisioner-69854ff78c-t264h        1/1     Running   0          46m
-nfs-client-provisioner-69854ff78c-wz9ds        1/1     Running   0          46m
-nfs-client-provisioner-69854ff78c-zmjcn        1/1     Running   0          46m
 ```
 
 For more detailed information use `describe`
@@ -415,38 +283,13 @@ cat <<EOF> ops-manager.yaml
 apiVersion: mongodb.com/v1
 kind: MongoDBOpsManager
 metadata:
-  name: ops-manager
+  name: mongodb-ops-manager
 spec:
   replicas: 1
-  version: 8.0.0
-  adminCredentials: mongodb-ops-manager # Should match metadata.name
+  version: 6.0.0
+  adminCredentials: mongodb-ops-manager    # Should match metadata.name
                                            # in the secret
                                            # for the admin user
-  statefulSet:
-    spec:
-      template:
-        metadata:
-          annotations:
-            key1: value1
-        spec:
-          volumes:
-            - name: mongod-binaries-volume
-              # replace this with a real persistent volume
-              emptyDir: {}
-          containers:
-            - name: mongodb-ops-manager
-              volumeMounts:
-                - mountPath: /mongodb-ops-manager/mongodb-releases/
-                  name: mongod-binaries-volume
-              resources:
-                limits:
-                  cpu: '0.70'
-                  memory: 6G
-          tolerations:
-            - key: "key"
-              operator: "Exists"
-              effect: "NoSchedule"
-
   externalConnectivity:
     type: NodePort
 
@@ -454,28 +297,10 @@ spec:
     passwordSecretKeyRef:
       name: mongodb-ops-manager-db
       key: password
-    members: 3
     topology: SingleCluster
-    version: 8.0.0
-    podSpec:
-      #cpu: '0.25'
-      #memory: 350M
-      persistence:
-        single:
-          storage: 1G
-      podTemplate:
-        spec:
-          # This container will be added to each pod as a sidecar
-          containers:
-            - name: appdb-sidecar
-              image: busybox
-              command: ["sleep"]
-              args: [ "infinity" ]
-              resources:
-                limits:
-                  cpu: "1"
-                requests:
-                  cpu: 500m
+    members: 3
+    version: 6.0.18
+...
 EOF
 
 kubectl create -f ops-manager.yaml
@@ -483,13 +308,20 @@ kubectl create -f ops-manager.yaml
 
 Get logs
 ```bash
-kubectl get events --sort-by='.metadata.creationTimestamp'
+kubectl get events --sort-by='.metadata.creationTimestamp' -w
 kubectl logs -f deployment/mongodb-enterprise-operator
 ```
 
-Make storage class default:
+Good State
+You will need to see the following 
 ```bash
-kubectl patch storageclass nfs-client -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+kubectl get po
+NAME                                           READY   STATUS    RESTARTS   AGE
+mongodb-enterprise-operator-766cfd5cbd-xqw6x   1/1     Running   0          76m
+mongodb-ops-manager-0                          1/1     Running   0          13m
+mongodb-ops-manager-db-0                       3/3     Running   0          14m
+mongodb-ops-manager-db-1                       3/3     Running   0          14m
+mongodb-ops-manager-db-2                       3/3     Running   0          13m
 ```
 
 Port Forwarding
@@ -498,3 +330,9 @@ mongodb-enterprise-kubernetes % kubectl port-forward --address 0.0.0.0 svc/mongo
 Forwarding from 0.0.0.0:9080 -> 8080
 Handling connection for 9080
 ```
+
+From  browser visit the address of the master node on port 9080. My master node address is 192.168.0.200.
+
+http://192.168.0.200:9080/account/login
+
+![img_1.png](img_1.png)
