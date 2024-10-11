@@ -218,11 +218,20 @@ worker-node03   Ready    <none>          62s   v1.27.16   10.0.0.13     <none>  
 ### Storage
 
 Given that we are planning to spin up databases with persistence it makes sense to have a filesystem available.
-Let's go ahead and create a filesystem that is kubernetes dynamic using a NFS. What I am about to do
+Let's go ahead and create a network filesystem that is kubernetes dynamic using a NFS. What I am about to do
 you would not consider this is production verbatim and as we are running this on the laptop it makes 
 perfect sense.
 
-We will need to do some work on each host so follow the steps below.
+<B>Rancher Local Provisioner Storage</b><P>
+Alternatively use rancher.io local [provisioner](https://github.com/rancher/local-path-provisioner).
+Then make it the default storage class with
+```bash
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml
+kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+```
+
+<B>Network File System</B></P>
+Below are the steps for NFS and will need to do some work on each host so follow the steps below.
 
 #### Master Node
 
@@ -346,3 +355,146 @@ mount | grep kubed
 ```
 
 
+### MongoDB
+
+#### Operator
+
+Install the Operator from using git checkout the mongodb repo and then install the operator and the crd's 
+for the specific version. I have chose 1.28.0
+```bash
+cd ~
+git clone https://github.com/mongodb/mongodb-enterprise-kubernetes.git
+cd mongodb-enterprise-kubernetes/
+kubectl create ns mongodb
+kubectl apply -f https://raw.githubusercontent.com/mongodb/mongodb-enterprise-kubernetes/1.28.0/mongodb-enterprise.yaml
+kubectl apply -f https://raw.githubusercontent.com/mongodb/mongodb-enterprise-kubernetes/1.28.0/crds.yaml
+```
+
+Check Operator was successfully installed
+```bash
+kubectl get pods -n mongodb
+NAME                                           READY   STATUS    RESTARTS   AGE
+mongodb-enterprise-operator-5785dd8cbb-n4685   1/1     Running   0          61s
+nfs-client-provisioner-69854ff78c-4g4sm        1/1     Running   0          46m
+nfs-client-provisioner-69854ff78c-jxgfx        1/1     Running   0          46m
+nfs-client-provisioner-69854ff78c-t264h        1/1     Running   0          46m
+nfs-client-provisioner-69854ff78c-wz9ds        1/1     Running   0          46m
+nfs-client-provisioner-69854ff78c-zmjcn        1/1     Running   0          46m
+```
+
+For more detailed information use `describe`
+```bash
+kubectl describe deployments mongodb-enterprise-operator -n mongodb
+```
+
+#### Ops Mananger
+
+We need to have a running version of cloud manager of ops manager to deploy or working data cluster replicaset 
+or shards. In this section we will use the operator to install OpsManage.
+
+![img.png](img.png)
+
+Set the current config to use the namespace mongodb as the default.
+```bash
+kubectl config set-context --current --namespace=mongodb
+```
+
+For non https connctions to Ops Manager we need to set up the credentials. Use these 
+to login into Ops Manager:
+```bash
+kubectl create secret generic mongodb-ops-manager --from-literal=Username=admin --from-literal=Password=password1234! --from-literal=FirstName=Naresh --from-literal=LastName=Maharaj
+```
+Create the password and username for the Ops Manager db
+```bash
+kubectl create secret generic mongodb-ops-manager-db --from-literal=password=password1234!
+```
+
+Create the config
+```bash
+cat <<EOF> ops-manager.yaml
+apiVersion: mongodb.com/v1
+kind: MongoDBOpsManager
+metadata:
+  name: ops-manager
+spec:
+  replicas: 1
+  version: 8.0.0
+  adminCredentials: mongodb-ops-manager # Should match metadata.name
+                                           # in the secret
+                                           # for the admin user
+  statefulSet:
+    spec:
+      template:
+        metadata:
+          annotations:
+            key1: value1
+        spec:
+          volumes:
+            - name: mongod-binaries-volume
+              # replace this with a real persistent volume
+              emptyDir: {}
+          containers:
+            - name: mongodb-ops-manager
+              volumeMounts:
+                - mountPath: /mongodb-ops-manager/mongodb-releases/
+                  name: mongod-binaries-volume
+              resources:
+                limits:
+                  cpu: '0.70'
+                  memory: 6G
+          tolerations:
+            - key: "key"
+              operator: "Exists"
+              effect: "NoSchedule"
+
+  externalConnectivity:
+    type: NodePort
+
+  applicationDatabase:
+    passwordSecretKeyRef:
+      name: mongodb-ops-manager-db
+      key: password
+    members: 3
+    topology: SingleCluster
+    version: 8.0.0
+    podSpec:
+      #cpu: '0.25'
+      #memory: 350M
+      persistence:
+        single:
+          storage: 1G
+      podTemplate:
+        spec:
+          # This container will be added to each pod as a sidecar
+          containers:
+            - name: appdb-sidecar
+              image: busybox
+              command: ["sleep"]
+              args: [ "infinity" ]
+              resources:
+                limits:
+                  cpu: "1"
+                requests:
+                  cpu: 500m
+EOF
+
+kubectl create -f ops-manager.yaml
+```
+
+Get logs
+```bash
+kubectl get events --sort-by='.metadata.creationTimestamp'
+kubectl logs -f deployment/mongodb-enterprise-operator
+```
+
+Make storage class default:
+```bash
+kubectl patch storageclass nfs-client -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+```
+
+Port Forwarding
+```bash
+mongodb-enterprise-kubernetes % kubectl port-forward --address 0.0.0.0 svc/mongodb-ops-manager-svc-ext 9080:8080
+Forwarding from 0.0.0.0:9080 -> 8080
+Handling connection for 9080
+```
